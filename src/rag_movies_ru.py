@@ -34,7 +34,10 @@ def tmdb_movie_ru(mid: int) -> Dict[str, Any]:
     j = _get(
         f"https://api.themoviedb.org/3/movie/{mid}",
         headers=h,
-        params={"language": "ru-RU", "append_to_response": "external_ids,credits"}
+        params={
+            "language": "ru-RU",
+            "append_to_response": "external_ids,credits,keywords,release_dates,alternative_titles,translations,recommendations,similar"
+        }
     )
     if not j:
         return {}
@@ -43,6 +46,44 @@ def tmdb_movie_ru(mid: int) -> Dict[str, Any]:
     cast = (j.get("credits") or {}).get("cast") or []
     directors = [p.get("name") for p in crew if (p.get("job") == "Director" and p.get("name"))]
     actors_main = [p.get("name") for p in cast if p.get("name")][:10]  # топ-10 по биллингу
+
+    # дополнительные поля для RAG
+    # writers
+    writers = [p.get("name") for p in crew if p.get("job") in {"Writer","Screenplay","Story","Author"} and p.get("name")]
+
+    # characters of top cast
+    characters_main = [p.get("character") for p in cast if p.get("character")][:10]
+
+    # alternative titles (ru/regional)
+    alts = []
+    for t in (j.get("alternative_titles") or {}).get("titles", []):
+        if (t.get("iso_639_1") == "ru") or (t.get("iso_3166_1") in {"RU","UA","BY","KZ"}):
+            n = t.get("title")
+            if n and n not in alts:
+                alts.append(n)
+
+    # keywords
+    _kw = (j.get("keywords") or {})
+    kw_list = _kw.get("keywords") or _kw.get("results") or []
+    keywords = [k.get("name") for k in kw_list if k.get("name")]
+
+    # collection
+    coll = j.get("belongs_to_collection") or {}
+    collection_id = coll.get("id")
+    collection_name = coll.get("name")
+
+    # similar & recommendations (ids + titles)
+    sim_results = (j.get("similar") or {}).get("results") or []
+    rec_results = (j.get("recommendations") or {}).get("results") or []
+    similar_tmdb_ids = [it.get("id") for it in sim_results if it.get("id")]
+    recommendation_tmdb_ids = [it.get("id") for it in rec_results if it.get("id")]
+    similar_titles_ru = [it.get("title") or it.get("name") for it in sim_results if (it.get("title") or it.get("name"))]
+    recommendation_titles_ru = [it.get("title") or it.get("name") for it in rec_results if (it.get("title") or it.get("name"))]
+
+    # other textual signals
+    tagline = j.get("tagline")
+    original_title = j.get("original_title")
+    original_language = j.get("original_language")
 
     out = {
         "source": "tmdb",
@@ -59,6 +100,21 @@ def tmdb_movie_ru(mid: int) -> Dict[str, Any]:
         "homepage": j.get("homepage"),
         "directors": directors,
         "actors_main": actors_main,
+        "genres": [g.get("name") for g in (j.get("genres") or []) if g.get("name")],
+
+        "writers": writers,
+        "characters_main": characters_main,
+        "alt_titles_ru": alts,
+        "keywords": keywords,
+        "original_title": original_title,
+        "original_language": original_language,
+        "collection_id": collection_id,
+        "collection_name": collection_name,
+        "tagline": tagline,
+        "similar_titles_ru": similar_titles_ru[:20],
+        "recommendation_titles_ru": recommendation_titles_ru[:20],
+        "similar_tmdb_ids": similar_tmdb_ids,
+        "recommendation_tmdb_ids": recommendation_tmdb_ids,
     }
 
     # если overview пуст на ru — пробуем переводы
@@ -154,7 +210,7 @@ def get_ru_record_by_tmdb_id(mid: int, min_chars: int = 40, kp_mode: str = "miss
         kpdoc = kp_search(title_guess) if title_guess else None
         if kpdoc:
             kp = kp_to_record(kpdoc)
-            for k in ("title_ru","overview_ru","poster_url","rating","votes","year","budget","revenue","url"):
+            for k in ("title_ru","overview_ru","poster_url","rating","votes","year","budget","revenue","url","genres"):
                 if not rec.get(k) and kp.get(k):
                     rec[k] = kp[k]
             if "kp_id" not in rec and kp.get("kp_id"):
@@ -172,7 +228,9 @@ def get_ru_record_by_tmdb_id(mid: int, min_chars: int = 40, kp_mode: str = "miss
     # build clean output
     meta_keys = [
         "source","tmdb_id","imdb_id","kp_id","year","poster_url",
-        "rating","votes","budget","revenue","homepage","url"
+        "rating","votes","budget","revenue","homepage","url",
+        "original_title","original_language","collection_id","collection_name",
+        "similar_tmdb_ids","recommendation_tmdb_ids"
     ]
     meta = {k: rec.get(k) for k in meta_keys if rec.get(k) is not None}
 
@@ -181,6 +239,17 @@ def get_ru_record_by_tmdb_id(mid: int, min_chars: int = 40, kp_mode: str = "miss
         "overview_ru": rec.get("overview_ru"),
         "directors": rec.get("directors") or [],
         "actors_main": rec.get("actors_main") or [],
+        "genres": rec.get("genres") or [],
+        "tagline": rec.get("tagline"),
+        "alt_titles_ru": rec.get("alt_titles_ru") or [],
+        "keywords": rec.get("keywords") or [],
+        "characters_main": rec.get("characters_main") or [],
+        "writers": rec.get("writers") or [],
+        "original_title": rec.get("original_title"),
+        "original_language": rec.get("original_language"),
+        "collection_name": rec.get("collection_name"),
+        "similar_titles_ru": rec.get("similar_titles_ru") or [],
+        "recommendation_titles_ru": rec.get("recommendation_titles_ru") or [],
         "meta": meta,
     }
 
@@ -205,7 +274,8 @@ def kp_to_record(doc: dict) -> Dict[str, Any]:
         "votes": (doc.get("votes") or {}).get("kp"),
         "budget": (doc.get("budget") or {}).get("value"),
         "revenue": (doc.get("fees") or {}).get("world", {}).get("value"),
-        "url": f"https://www.kinopoisk.ru/film/{doc.get('id')}/" if doc.get("id") else None
+        "url": f"https://www.kinopoisk.ru/film/{doc.get('id')}/" if doc.get("id") else None,
+        "genres": [g.get("name") for g in (doc.get("genres") or []) if isinstance(g, dict) and g.get("name")],
     }
 
 # ---------- Wikipedia RU (хвостовой) ----------
@@ -243,7 +313,7 @@ def get_ru_record(title: str, min_chars: int = 40, kp_mode: str = "missing-ru", 
         kpdoc = kp_search(title)
         if kpdoc:
             kp = kp_to_record(kpdoc)
-            for k in ("title_ru","overview_ru","poster_url","rating","votes","year","budget","revenue","url"):
+            for k in ("title_ru","overview_ru","poster_url","rating","votes","year","budget","revenue","url","genres"):
                 if not rec.get(k) and kp.get(k):
                     rec[k] = kp[k]
             if "kp_id" not in rec and kp.get("kp_id"):
@@ -260,7 +330,9 @@ def get_ru_record(title: str, min_chars: int = 40, kp_mode: str = "missing-ru", 
     # минимальный набор + чистое meta без дублей
     meta_keys = [
         "source","tmdb_id","imdb_id","kp_id","year","poster_url",
-        "rating","votes","budget","revenue","homepage","url"
+        "rating","votes","budget","revenue","homepage","url",
+        "original_title","original_language","collection_id","collection_name",
+        "similar_tmdb_ids","recommendation_tmdb_ids"
     ]
     meta = {k: rec.get(k) for k in meta_keys if rec.get(k) is not None}
 
@@ -269,6 +341,17 @@ def get_ru_record(title: str, min_chars: int = 40, kp_mode: str = "missing-ru", 
         "overview_ru": rec.get("overview_ru"),
         "directors": rec.get("directors") or [],
         "actors_main": rec.get("actors_main") or [],
+        "genres": rec.get("genres") or [],
+        "tagline": rec.get("tagline"),
+        "alt_titles_ru": rec.get("alt_titles_ru") or [],
+        "keywords": rec.get("keywords") or [],
+        "characters_main": rec.get("characters_main") or [],
+        "writers": rec.get("writers") or [],
+        "original_title": rec.get("original_title"),
+        "original_language": rec.get("original_language"),
+        "collection_name": rec.get("collection_name"),
+        "similar_titles_ru": rec.get("similar_titles_ru") or [],
+        "recommendation_titles_ru": rec.get("recommendation_titles_ru") or [],
         "meta": meta
     }
 
@@ -323,6 +406,8 @@ def cli():
                 rec = get_ru_record(t, min_chars=args.min_chars, kp_mode=args.kp_mode, kp_budget=budget)
                 if rec.get("overview_ru") and len(rec["overview_ru"]) < args.min_chars:
                     rec["overview_ru"] = None
+                if not rec.get("overview_ru"):
+                    continue
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
                 time.sleep(args.sleep)
     elif args.cmd == "top":
@@ -333,6 +418,8 @@ def cli():
                 rec = get_ru_record_by_tmdb_id(mid, min_chars=args.min_chars, kp_mode=args.kp_mode, kp_budget=budget)
                 if rec.get("overview_ru") and len(rec["overview_ru"]) < args.min_chars:
                     rec["overview_ru"] = None
+                if not rec.get("overview_ru"):
+                    continue
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
                 time.sleep(args.sleep)
     else:
